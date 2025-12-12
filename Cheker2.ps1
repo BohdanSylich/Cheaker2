@@ -1,61 +1,101 @@
 function Find-BankFile-Traces {
-    Write-Host "Пошук слідів файла bаnk.exe..." -ForegroundColor Cyan
-    $searchPatterns = @('b[аa]nk\.exe', 'bаnk.exe')
+    Write-Host "Пошук слідів файла bаnk.exe (всі варіанти)..." -ForegroundColor Cyan
+    
+    # Всі можливі варіанти назви файла
+    $searchPatterns = @(
+        'b[аa]nk\.exe',           # звичайні варіанти
+        'bаnk\.exe',             # точна назва з кирилицею
+        'bank\.exe',             # з латинською
+        'b[^a-zA-Z0-9\s\.]nk\.exe',  # зі спецсимволами між b і nk
+        'b.*nk\.exe',            # будь-які символи між b і nk
+        'b¦-nk\.exe',            # конкретно твій варіант
+        'b[^\x00-\x7F]nk\.exe',  # з Unicode символами
+        'b.*\.exe.*nk'           # в будь-якому місці
+    )
+    
     $results = @()
-
-    # 1. Перевірка Prefetch
-    Write-Host "1. Аналіз Prefetch..." -NoNewline
-    $pfFiles = Get-ChildItem "C:\Windows\Prefetch" -Filter "*.pf" -ErrorAction SilentlyContinue
+    
+    # 1. Перевірка USN Journal (Journal)
+    Write-Host "1. Аналіз USN Journal..." -NoNewline
+    $journalPath = "C:\Temp\Dump\Journal"  # або де у тебе журнал
+    $foundInJournal = 0
+    
+    if (Test-Path $journalPath) {
+        $journalFiles = Get-ChildItem $journalPath -Filter "*.csv" -ErrorAction SilentlyContinue
+        foreach ($file in $journalFiles) {
+            try {
+                $content = Get-Content $file.FullName -Raw -ErrorAction SilentlyContinue
+                if ($content) {
+                    foreach ($pattern in $searchPatterns) {
+                        $matches = [regex]::Matches($content, $pattern, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+                        if ($matches.Count -gt 0) {
+                            foreach ($match in $matches) {
+                                $results += "USN Journal ($($file.Name)): $($match.Value)"
+                                $foundInJournal++
+                            }
+                        }
+                    }
+                }
+            } catch {}
+        }
+    }
+    Write-Host " [$foundInJournal знайдено]" -ForegroundColor $(if($foundInJournal-gt0){'Red'}else{'Green'})
+    
+    # 2. Перевірка Prefetch
+    Write-Host "2. Аналіз Prefetch..." -NoNewline
     $foundInPrefetch = 0
+    $pfFiles = Get-ChildItem "C:\Windows\Prefetch" -Filter "*.pf" -ErrorAction SilentlyContinue
+    
     foreach ($pf in $pfFiles) {
         try {
             $content = Get-Content $pf.FullName -Raw -ErrorAction SilentlyContinue
-            foreach ($pattern in $searchPatterns) {
-                if ($content -match $pattern) {
-                    $results += "Prefetch: $($pf.Name)"
-                    $foundInPrefetch++
-                    break
+            if ($content) {
+                foreach ($pattern in $searchPatterns) {
+                    if ($content -match $pattern) {
+                        $results += "Prefetch: $($pf.Name) -> знайдено '$pattern'"
+                        $foundInPrefetch++
+                        break
+                    }
                 }
             }
         } catch {}
     }
     Write-Host " [$foundInPrefetch знайдено]" -ForegroundColor $(if($foundInPrefetch-gt0){'Red'}else{'Green'})
-
-    # 2. Перевірка реєстру
-    Write-Host "2. Аналіз реєстру..." -NoNewline
+    
+    # 3. Перевірка реєстру
+    Write-Host "3. Аналіз реєстру..." -NoNewline
     $registryPaths = @(
         "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run",
-        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce",
         "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run",
-        "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce",
-        "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options",
         "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\RunMRU",
         "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\RecentDocs"
     )
-
+    
     $foundInRegistry = 0
     foreach ($regPath in $registryPaths) {
         if (Test-Path $regPath) {
             try {
-                # Пошук в ключах
                 Get-ChildItem $regPath -ErrorAction SilentlyContinue | ForEach-Object {
                     $key = $_
+                    
+                    # Пошук в імені ключа
                     foreach ($pattern in $searchPatterns) {
                         if ($key.PSChildName -match $pattern) {
                             $results += "Реєстр (ключ): $($key.Name)"
                             $foundInRegistry++
                         }
                     }
-
+                    
                     # Пошук в значеннях
                     $values = Get-ItemProperty $key.PSPath -ErrorAction SilentlyContinue
                     if ($values) {
                         $values.PSObject.Properties | ForEach-Object {
                             $value = $_.Value
                             if ($value -ne $null) {
+                                $valueStr = $value.ToString()
                                 foreach ($pattern in $searchPatterns) {
-                                    if ($value.ToString() -match $pattern) {
-                                        $results += "Реєстр (значення): $($key.Name) -> $($_.Name)"
+                                    if ($valueStr -match $pattern) {
+                                        $results += "Реєстр (значення): $($key.Name)\$($_.Name) -> $valueStr"
                                         $foundInRegistry++
                                     }
                                 }
@@ -67,184 +107,260 @@ function Find-BankFile-Traces {
         }
     }
     Write-Host " [$foundInRegistry знайдено]" -ForegroundColor $(if($foundInRegistry-gt0){'Red'}else{'Green'})
-
-    # 3. Перевірка Event Logs
-    Write-Host "3. Аналіз Event Logs..." -NoNewline
-    $eventLogs = @(
-        @{LogName = "Security"; ID = 4688},
-        @{LogName = "System"; ID = 7036},
-        @{LogName = "Microsoft-Windows-PowerShell/Operational"; ID = 4104}
+    
+    # 4. Перевірка Journal файлів (якщо вони в Temp\Dump)
+    Write-Host "4. Аналіз Journal файлів..." -NoNewline
+    $foundInJournalFiles = 0
+    $journalFilesToCheck = @(
+        "C:\Temp\Dump\Journal\0_RawDump.csv",
+        "C:\Temp\Dump\Journal\CreatedFiles.txt",
+        "C:\Temp\Dump\Journal\DeletedFiles.txt",
+        "C:\Temp\Dump\Journal\Keywordsearch.txt"
     )
-
-    $foundInEvents = 0
-    foreach ($log in $eventLogs) {
-        try {
-            $events = Get-WinEvent -FilterHashtable @{LogName = $log.LogName; ID = $log.ID} -ErrorAction SilentlyContinue -MaxEvents 100
-            foreach ($event in $events) {
-                foreach ($pattern in $searchPatterns) {
-                    if ($event.Message -match $pattern) {
-                        $results += "Event Log: $($log.LogName) - $($event.TimeCreated)"
-                        $foundInEvents++
-                        break
-                    }
-                }
-            }
-        } catch {}
-    }
-    Write-Host " [$foundInEvents знайдено]" -ForegroundColor $(if($foundInEvents-gt0){'Red'}else{'Green'})
-
-    # 4. Перевірка Recent
-    Write-Host "4. Аналіз Recent..." -NoNewline
-    $foundInRecent = 0
-    $recentPaths = @(
-        "$env:APPDATA\Microsoft\Windows\Recent",
-        "$env:APPDATA\Microsoft\Windows\Recent\AutomaticDestinations"
-    )
-
-    foreach ($recentPath in $recentPaths) {
-        if (Test-Path $recentPath) {
+    
+    foreach ($journalFile in $journalFilesToCheck) {
+        if (Test-Path $journalFile) {
             try {
-                $items = Get-ChildItem $recentPath -ErrorAction SilentlyContinue
-                foreach ($item in $items) {
+                $content = Get-Content $journalFile -Raw -ErrorAction SilentlyContinue
+                if ($content) {
                     foreach ($pattern in $searchPatterns) {
-                        if ($item.Name -match $pattern -or (Test-Path $item.FullName -PathType Container -ErrorAction SilentlyContinue)) {
-                            $results += "Recent: $($item.FullName)"
-                            $foundInRecent++
-                            break
+                        $matches = [regex]::Matches($content, $pattern, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+                        if ($matches.Count -gt 0) {
+                            foreach ($match in $matches) {
+                                $results += "Journal файл ($([System.IO.Path]::GetFileName($journalFile))): $($match.Value)"
+                                $foundInJournalFiles++
+                            }
                         }
                     }
                 }
             } catch {}
         }
     }
-    Write-Host " [$foundInRecent знайдено]" -ForegroundColor $(if($foundInRecent-gt0){'Red'}else{'Green'})
-
-    # 5. Перевірка Temp
-    Write-Host "5. Аналіз Temp..." -NoNewline
-    $tempPaths = @($env:TEMP, "$env:SystemRoot\Temp")
-    $foundInTemp = 0
-
-    foreach ($tempPath in $tempPaths) {
-        if (Test-Path $tempPath) {
+    Write-Host " [$foundInJournalFiles знайдено]" -ForegroundColor $(if($foundInJournalFiles-gt0){'Red'}else{'Green'})
+    
+    # 5. Перевірка процесів (Raw процеси)
+    Write-Host "5. Аналіз процесів..." -NoNewline
+    $foundInProcesses = 0
+    $processFiles = @(
+        "C:\Temp\Dump\Processes\Raw\explorer.txt",
+        "C:\Temp\Dump\Processes\Raw\dps.txt",
+        "C:\Temp\Dump\Processes\Raw\wsearch.txt"
+    )
+    
+    foreach ($procFile in $processFiles) {
+        if (Test-Path $procFile) {
             try {
-                Get-ChildItem $tempPath -ErrorAction SilentlyContinue | ForEach-Object {
+                $content = Get-Content $procFile -Raw -ErrorAction SilentlyContinue
+                if ($content) {
                     foreach ($pattern in $searchPatterns) {
-                        if ($_.Name -match $pattern) {
-                            $results += "Temp: $($_.FullName)"
-                            $foundInTemp++
-                            break
+                        $matches = [regex]::Matches($content, $pattern, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+                        if ($matches.Count -gt 0) {
+                            foreach ($match in $matches) {
+                                $results += "Процеси ($([System.IO.Path]::GetFileName($procFile))): $($match.Value)"
+                                $foundInProcesses++
+                            }
                         }
                     }
                 }
             } catch {}
         }
     }
-    Write-Host " [$foundInTemp знайдено]" -ForegroundColor $(if($foundInTemp-gt0){'Red'}else{'Green'})
-
+    Write-Host " [$foundInProcesses знайдено]" -ForegroundColor $(if($foundInProcesses-gt0){'Red'}else{'Green'})
+    
     # Підсумок
-    $totalFound = $foundInPrefetch + $foundInRegistry + $foundInEvents + $foundInRecent + $foundInTemp
-
+    $totalFound = $foundInJournal + $foundInPrefetch + $foundInRegistry + $foundInJournalFiles + $foundInProcesses
+    
     Write-Host ""
-    Write-Host "Результат пошуку:" -ForegroundColor Cyan
+    Write-Host "="*50 -ForegroundColor Cyan
+    Write-Host "РЕЗУЛЬТАТ ПОШУКУ:" -ForegroundColor Cyan
     Write-Host "Всього знайдено згадок: $totalFound" -ForegroundColor $(if($totalFound-gt0){'Yellow'}else{'Green'})
-
+    
     if ($totalFound -gt 0) {
-        Write-Host "Знайдені згадки:" -ForegroundColor Yellow
-        foreach ($result in $results) {
-            Write-Host "  - $result" -ForegroundColor Gray
+        Write-Host "`nЗнайдені згадки:" -ForegroundColor Yellow
+        foreach ($result in $results | Select-Object -Unique) {
+            Write-Host "  • $result" -ForegroundColor Gray
         }
     }
-
+    
     return @{
         Total = $totalFound
-        Details = $results
+        Details = $results | Select-Object -Unique
         Counts = @{
+            Journal = $foundInJournal
             Prefetch = $foundInPrefetch
             Registry = $foundInRegistry
-            Events = $foundInEvents
-            Recent = $foundInRecent
-            Temp = $foundInTemp
+            JournalFiles = $foundInJournalFiles
+            Processes = $foundInProcesses
         }
     }
 }
 
-function Clean-BankFile-Traces {
+function Clean-BankFile-Traces-All {
     param([switch]$FullMode = $false)
-
-    $searchPatterns = @('b[аa]nk\.exe', 'bаnk.exe')
+    
+    # Всі можливі варіанти назви
+    $searchPatterns = @(
+        'b[аa]nk\.exe',
+        'bаnk\.exe',
+        'bank\.exe',
+        'b[^a-zA-Z0-9\s\.]nk\.exe',
+        'b.*nk\.exe',
+        'b¦-nk\.exe',
+        'b[^\x00-\x7F]nk\.exe',
+        'b.*\.exe.*nk'
+    )
+    
     $cleanedCount = 0
     $errors = 0
-
-    Write-Host "`nПочинаю очищення слідів..." -ForegroundColor Cyan
-
-    # 1. Очищення Prefetch
-    Write-Host "1. Очищення Prefetch..." -NoNewline
+    
+    Write-Host "`nПочинаю очищення всіх слідів..." -ForegroundColor Cyan
+    
+    # 1. Очищення Journal файлів (спеціально для твого випадку)
+    Write-Host "1. Очищення Journal файлів..." -NoNewline
+    $journalFiles = @(
+        "C:\Temp\Dump\Journal\0_RawDump.csv",
+        "C:\Temp\Dump\Journal\CreatedFiles.txt",
+        "C:\Temp\Dump\Journal\DeletedFiles.txt",
+        "C:\Temp\Dump\Journal\Keywordsearch.txt",
+        "C:\Temp\Dump\Journal\ModifiedBats.txt",
+        "C:\Temp\Dump\Journal\ObjectIDChange.txt",
+        "C:\Temp\Dump\Journal\ReplacedExe.txt"
+    )
+    
+    $cleanedJournal = 0
+    foreach ($journalFile in $journalFiles) {
+        if (Test-Path $journalFile) {
+            try {
+                $content = Get-Content $journalFile -Raw -ErrorAction SilentlyContinue
+                if ($content) {
+                    $modified = $false
+                    $newContent = $content
+                    
+                    foreach ($pattern in $searchPatterns) {
+                        $newContent = $newContent -replace $pattern, "[REMOVED]"
+                    }
+                    
+                    if ($newContent -ne $content) {
+                        Set-Content -Path $journalFile -Value $newContent -Force -ErrorAction SilentlyContinue
+                        $cleanedJournal++
+                        $cleanedCount++
+                        $modified = $true
+                    }
+                    
+                    if ($modified) {
+                        # Додатково видаляємо весь файл якщо він став малим
+                        if ((Get-Item $journalFile).Length -lt 100) {
+                            Remove-Item $journalFile -Force -ErrorAction SilentlyContinue
+                        }
+                    }
+                }
+            } catch {
+                $errors++
+            }
+        }
+    }
+    Write-Host " [$cleanedJournal файлів]" -ForegroundColor $(if($cleanedJournal-gt0){'Green'}else{'Gray'})
+    
+    # 2. Очищення Prefetch
+    Write-Host "2. Очищення Prefetch..." -NoNewline
     $pfFiles = Get-ChildItem "C:\Windows\Prefetch" -Filter "*.pf" -ErrorAction SilentlyContinue
     $deletedPrefetch = 0
+    
     foreach ($pf in $pfFiles) {
         try {
             $content = Get-Content $pf.FullName -Raw -ErrorAction SilentlyContinue
-            foreach ($pattern in $searchPatterns) {
-                if ($content -match $pattern) {
+            if ($content) {
+                $shouldDelete = $false
+                foreach ($pattern in $searchPatterns) {
+                    if ($content -match $pattern) {
+                        $shouldDelete = $true
+                        break
+                    }
+                }
+                
+                if ($shouldDelete) {
                     Remove-Item $pf.FullName -Force -ErrorAction SilentlyContinue
                     $deletedPrefetch++
                     $cleanedCount++
-                    break
                 }
             }
         } catch {
             $errors++
         }
     }
-    Write-Host " [$deletedPrefetch видалено]" -ForegroundColor $(if($deletedPrefetch-gt0){'Green'}else{'Gray'})
-
-    # 2. Очищення реєстру
-    Write-Host "2. Очищення реєстру..." -NoNewline
-    $registryPaths = @(
-        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run",
-        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce",
-        "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run",
-        "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce",
-        "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\RunMRU",
-        "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\RecentDocs"
-    )
-
-    $deletedRegistry = 0
-    foreach ($regPath in $registryPaths) {
-        if (Test-Path $regPath) {
-            try {
-                Get-ChildItem $regPath -ErrorAction SilentlyContinue | ForEach-Object {
-                    $key = $_
-                    $shouldDelete = $false
-
-                    # Перевірка імені ключа
+    Write-Host " [$deletedPrefetch файлів]" -ForegroundColor $(if($deletedPrefetch-gt0){'Green'}else{'Gray'})
+    
+    # 3. Очищення USN Journal
+    Write-Host "3. Очищення USN Journal..." -NoNewline
+    try {
+        fsutil usn deletejournal /D C: 2>$null
+        $cleanedCount++
+        Write-Host " [виконано]" -ForegroundColor Green
+    } catch {
+        $errors++
+        Write-Host " [помилка]" -ForegroundColor Red
+    }
+    
+    # 4. Очищення файлів процесів
+    Write-Host "4. Очищення файлів процесів..." -NoNewline
+    $processFiles = Get-ChildItem "C:\Temp\Dump\Processes\Raw" -Filter "*.txt" -ErrorAction SilentlyContinue
+    $cleanedProcessFiles = 0
+    
+    foreach ($procFile in $processFiles) {
+        try {
+            if (Test-Path $procFile.FullName) {
+                $content = Get-Content $procFile.FullName -Raw -ErrorAction SilentlyContinue
+                if ($content) {
+                    $modified = $false
+                    $newContent = $content
+                    
                     foreach ($pattern in $searchPatterns) {
-                        if ($key.PSChildName -match $pattern) {
-                            $shouldDelete = $true
-                            break
-                        }
+                        $newContent = $newContent -replace $pattern, ""
                     }
-
-                    # Перевірка значень
-                    $values = Get-ItemProperty $key.PSPath -ErrorAction SilentlyContinue
-                    if ($values) {
-                        $values.PSObject.Properties | ForEach-Object {
-                            $value = $_.Value
-                            if ($value -ne $null) {
-                                foreach ($pattern in $searchPatterns) {
-                                    if ($value.ToString() -match $pattern) {
-                                        Remove-ItemProperty -Path $key.PSPath -Name $_.Name -Force -ErrorAction SilentlyContinue
-                                        $deletedRegistry++
-                                        $cleanedCount++
-                                    }
-                                }
-                            }
-                        }
+                    
+                    # Видаляємо порожні рядки
+                    $newContent = ($newContent -split "`n" | Where-Object { $_ -match '\S' }) -join "`n"
+                    
+                    if ($newContent -ne $content) {
+                        Set-Content -Path $procFile.FullName -Value $newContent -Force -ErrorAction SilentlyContinue
+                        $cleanedProcessFiles++
+                        $cleanedCount++
                     }
-
-                    if ($shouldDelete) {
-                        Remove-Item $key.PSPath -Recurse -Force -ErrorAction SilentlyContinue
-                        $deletedRegistry++
+                }
+            }
+        } catch {
+            $errors++
+        }
+    }
+    Write-Host " [$cleanedProcessFiles файлів]" -ForegroundColor $(if($cleanedProcessFiles-gt0){'Green'}else{'Gray'})
+    
+    # 5. Очищення Results.txt та інших звітів
+    Write-Host "5. Очищення звітів..." -NoNewline
+    $reportFiles = @(
+        "C:\Temp\Results.txt",
+        "C:\Temp\Dump\Paths.txt",
+        "C:\Temp\Dump\Unsigned.txt",
+        "C:\Temp\Dump\Filesize.txt",
+        "C:\Temp\Dump\Deletedfile.txt",
+        "C:\Temp\Dump\Debug.txt"
+    )
+    
+    $cleanedReports = 0
+    foreach ($reportFile in $reportFiles) {
+        if (Test-Path $reportFile) {
+            try {
+                $content = Get-Content $reportFile -Raw -ErrorAction SilentlyContinue
+                if ($content) {
+                    $modified = $false
+                    $newContent = $content
+                    
+                    foreach ($pattern in $searchPatterns) {
+                        $newContent = $newContent -replace $pattern, "[CLEANED]"
+                    }
+                    
+                    if ($newContent -ne $content) {
+                        Set-Content -Path $reportFile -Value $newContent -Force -ErrorAction SilentlyContinue
+                        $cleanedReports++
                         $cleanedCount++
                     }
                 }
@@ -253,60 +369,88 @@ function Clean-BankFile-Traces {
             }
         }
     }
-    Write-Host " [$deletedRegistry видалено]" -ForegroundColor $(if($deletedRegistry-gt0){'Green'}else{'Gray'})
-
-    # 3. Очищення Event Logs
-    Write-Host "3. Очищення Event Logs..." -NoNewline
-    $eventLogs = @("Security", "System", "Microsoft-Windows-PowerShell/Operational")
-    $cleanedLogs = 0
-
-    foreach ($logName in $eventLogs) {
-        try {
-            wevtutil cl $logName 2>$null
-            $cleanedLogs++
-            $cleanedCount++
-        } catch {
-            $errors++
-        }
-    }
-    Write-Host " [$cleanedLogs очищено]" -ForegroundColor $(if($cleanedLogs-gt0){'Green'}else{'Gray'})
-
-    # 4. Очищення Recent
-    Write-Host "4. Очищення Recent..." -NoNewline
-    $recentPaths = @(
-        "$env:APPDATA\Microsoft\Windows\Recent",
-        "$env:APPDATA\Microsoft\Windows\Recent\AutomaticDestinations"
+    Write-Host " [$cleanedReports файлів]" -ForegroundColor $(if($cleanedReports-gt0){'Green'}else{'Gray'})
+    
+    # 6. Видалення самого файла (якщо він ще існує)
+    Write-Host "6. Пошук та видалення файла..." -NoNewline
+    $possiblePaths = @(
+        "D:\projects\c#\laba1\bin\Debug\net9.0\b¦-nk.exe",
+        "D:\projects\c#\laba1\bin\Debug\net9.0\bаnk.exe",
+        "D:\projects\c#\laba1\bin\Debug\net9.0\bank.exe",
+        "C:\Windows\System32\drivers\bаnk.exe",
+        "C:\Program Files\bаnk.exe",
+        "C:\Users\$env:USERNAME\Desktop\bаnk.exe"
     )
-
-    $cleanedRecent = 0
-    foreach ($recentPath in $recentPaths) {
-        if (Test-Path $recentPath) {
+    
+    $deletedFiles = 0
+    foreach ($path in $possiblePaths) {
+        if (Test-Path $path) {
             try {
-                Remove-Item "$recentPath\*" -Recurse -Force -ErrorAction SilentlyContinue
-                $cleanedRecent++
+                Remove-Item $path -Force -ErrorAction SilentlyContinue
+                $deletedFiles++
                 $cleanedCount++
             } catch {
                 $errors++
             }
         }
     }
-    Write-Host " [$cleanedRecent очищено]" -ForegroundColor $(if($cleanedRecent-gt0){'Green'}else{'Gray'})
-
-    # 5. Очищення Temp
-    Write-Host "5. Очищення Temp..." -NoNewline
-    $tempPaths = @($env:TEMP, "$env:SystemRoot\Temp")
-    $cleanedTemp = 0
-
-    foreach ($tempPath in $tempPaths) {
-        if (Test-Path $tempPath) {
+    
+    # Додатковий пошук за патерном
+    try {
+        Get-ChildItem "D:\projects\c#\laba1\bin\Debug\net9.0\" -Filter "*nk.exe" -ErrorAction SilentlyContinue | ForEach-Object {
+            Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue
+            $deletedFiles++
+            $cleanedCount++
+        }
+    } catch {}
+    
+    Write-Host " [$deletedFiles файлів]" -ForegroundColor $(if($deletedFiles-gt0){'Green'}else{'Gray'})
+    
+    # 7. Очищення реєстру
+    Write-Host "7. Очищення реєстру..." -NoNewline
+    $registryPaths = @(
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run",
+        "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run",
+        "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\RunMRU"
+    )
+    
+    $cleanedRegistry = 0
+    foreach ($regPath in $registryPaths) {
+        if (Test-Path $regPath) {
             try {
-                Get-ChildItem $tempPath -ErrorAction SilentlyContinue | ForEach-Object {
+                Get-ChildItem $regPath -ErrorAction SilentlyContinue | ForEach-Object {
+                    $key = $_
+                    $modified = $false
+                    
+                    # Перевірка імені ключа
                     foreach ($pattern in $searchPatterns) {
-                        if ($_.Name -match $pattern) {
-                            Remove-Item $_.FullName -Force -Recurse -ErrorAction SilentlyContinue
-                            $cleanedTemp++
+                        if ($key.PSChildName -match $pattern) {
+                            Remove-Item $key.PSPath -Recurse -Force -ErrorAction SilentlyContinue
+                            $cleanedRegistry++
                             $cleanedCount++
+                            $modified = $true
                             break
+                        }
+                    }
+                    
+                    if (-not $modified) {
+                        # Перевірка значень
+                        $values = Get-ItemProperty $key.PSPath -ErrorAction SilentlyContinue
+                        if ($values) {
+                            $values.PSObject.Properties | ForEach-Object {
+                                $propName = $_.Name
+                                $value = $_.Value
+                                
+                                if ($value -ne $null) {
+                                    foreach ($pattern in $searchPatterns) {
+                                        if ($value.ToString() -match $pattern) {
+                                            Remove-ItemProperty -Path $key.PSPath -Name $propName -Force -ErrorAction SilentlyContinue
+                                            $cleanedRegistry++
+                                            $cleanedCount++
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -315,69 +459,43 @@ function Clean-BankFile-Traces {
             }
         }
     }
-    Write-Host " [$cleanedTemp видалено]" -ForegroundColor $(if($cleanedTemp-gt0){'Green'}else{'Gray'})
-
-    # 6. Очищення Windows Search (якщо FullMode)
-    if ($FullMode) {
-        Write-Host "6. Очищення Windows Search..." -NoNewline
-        try {
-            Stop-Service "WSearch" -Force -ErrorAction SilentlyContinue
-            Start-Sleep -Seconds 1
-            $searchPaths = @("C:\ProgramData\Microsoft\Search\Data\Applications\Windows", "$env:APPDATA\Microsoft\Search\Data")
-            foreach ($searchPath in $searchPaths) {
-                if (Test-Path $searchPath) {
-                    Get-ChildItem $searchPath -Filter "*.edb" -ErrorAction SilentlyContinue | Remove-Item -Force
-                }
-            }
-            Start-Service "WSearch" -ErrorAction SilentlyContinue
-            $cleanedCount++
-            Write-Host " [виконано]" -ForegroundColor Green
-        } catch {
-            $errors++
-            Write-Host " [помилка]" -ForegroundColor Red
-        }
-    }
-
-    # 7. USN Journal (якщо FullMode)
-    if ($FullMode) {
-        Write-Host "7. Очищення USN Journal..." -NoNewline
-        try {
-            fsutil usn deletejournal /D C: 2>$null
-            $cleanedCount++
-            Write-Host " [виконано]" -ForegroundColor Green
-        } catch {
-            $errors++
-            Write-Host " [помилка]" -ForegroundColor Red
-        }
-    }
-
-    # 8. Очищення історії PowerShell
-    Write-Host "8. Очищення історії..." -NoNewline
+    Write-Host " [$cleanedRegistry записів]" -ForegroundColor $(if($cleanedRegistry-gt0){'Green'}else{'Gray'})
+    
+    # 8. Очищення кешу та історії
+    Write-Host "8. Очищення кешу..." -NoNewline
     try {
+        # Recent
+        Remove-Item "$env:APPDATA\Microsoft\Windows\Recent\*" -Recurse -Force -ErrorAction SilentlyContinue
+        # Temp
+        Remove-Item "$env:TEMP\*" -Recurse -Force -ErrorAction SilentlyContinue
+        # Історія PowerShell
         Clear-History
         Remove-Item (Get-PSReadlineOption).HistorySavePath -ErrorAction SilentlyContinue 2>$null
+        
+        $cleanedCount++
         Write-Host " [виконано]" -ForegroundColor Green
     } catch {
         $errors++
         Write-Host " [помилка]" -ForegroundColor Red
     }
-
+    
     return @{
         Cleaned = $cleanedCount
         Errors = $errors
         Details = @{
+            Journal = $cleanedJournal
             Prefetch = $deletedPrefetch
-            Registry = $deletedRegistry
-            Events = $cleanedLogs
-            Recent = $cleanedRecent
-            Temp = $cleanedTemp
+            ProcessFiles = $cleanedProcessFiles
+            Reports = $cleanedReports
+            Files = $deletedFiles
+            Registry = $cleanedRegistry
         }
     }
 }
 
 # ===== Головна частина =====
-Write-Host "=== System Trace Cleaner ===" -ForegroundColor Blue
-Write-Host "Пошук та видалення слідів файла bаnk.exe" -ForegroundColor Gray
+Write-Host "=== Advanced Trace Cleaner ===" -ForegroundColor Blue
+Write-Host "Пошук та видалення ВСІХ слідів файла bаnk.exe (включаючи Unicode)" -ForegroundColor Gray
 Write-Host ""
 
 # Пошук слідів
@@ -394,7 +512,8 @@ if ($searchResults.Total -eq 0) {
 }
 
 Write-Host ""
-Write-Host "Знайдено $($searchResults.Total) згадок. Продовжити очищення?" -ForegroundColor Yellow
+Write-Host "Знайдено $($searchResults.Total) згадок у $($searchResults.Counts.Journal) Journal файлах" -ForegroundColor Yellow
+Write-Host "Продовжити повне очищення?" -ForegroundColor Yellow
 $response = Read-Host "Введіть Y для очищення або N для скасування"
 
 if ($response -ne 'Y') {
@@ -403,12 +522,9 @@ if ($response -ne 'Y') {
     exit 0
 }
 
+# Очищення всіх слідів
 Write-Host ""
-$fullModeResponse = Read-Host "Запустити повне очищення (включаючи USN Journal)? (Y/N)"
-$fullMode = ($fullModeResponse -eq 'Y')
-
-# Очищення слідів
-$cleanResults = Clean-BankFile-Traces -FullMode:$fullMode
+$cleanResults = Clean-BankFile-Traces-All -FullMode:$true
 
 Write-Host ""
 Write-Host "="*50 -ForegroundColor Cyan
@@ -416,17 +532,18 @@ Write-Host "РЕЗУЛЬТАТ ОЧИЩЕННЯ:" -ForegroundColor Cyan
 
 if ($cleanResults.Cleaned -gt 0) {
     Write-Host "✅ ОПЕРАЦІЯ УСПІШНА" -ForegroundColor Green
-    Write-Host "Видалено $($cleanResults.Cleaned) згадок про файл" -ForegroundColor Green
-
-    Write-Host "`nДеталі:" -ForegroundColor Yellow
+    Write-Host "Видалено $($cleanResults.Cleaned) слідів файла" -ForegroundColor Green
+    
+    Write-Host "`nДеталі очищення:" -ForegroundColor Yellow
+    if ($cleanResults.Details.Journal -gt 0) { Write-Host "  • Journal файли: $($cleanResults.Details.Journal)" -ForegroundColor Gray }
     if ($cleanResults.Details.Prefetch -gt 0) { Write-Host "  • Prefetch: $($cleanResults.Details.Prefetch)" -ForegroundColor Gray }
+    if ($cleanResults.Details.ProcessFiles -gt 0) { Write-Host "  • Файли процесів: $($cleanResults.Details.ProcessFiles)" -ForegroundColor Gray }
+    if ($cleanResults.Details.Reports -gt 0) { Write-Host "  • Звіти: $($cleanResults.Details.Reports)" -ForegroundColor Gray }
+    if ($cleanResults.Details.Files -gt 0) { Write-Host "  • Файли: $($cleanResults.Details.Files)" -ForegroundColor Gray }
     if ($cleanResults.Details.Registry -gt 0) { Write-Host "  • Реєстр: $($cleanResults.Details.Registry)" -ForegroundColor Gray }
-    if ($cleanResults.Details.Events -gt 0) { Write-Host "  • Event Logs: $($cleanResults.Details.Events)" -ForegroundColor Gray }
-    if ($cleanResults.Details.Recent -gt 0) { Write-Host "  • Recent: $($cleanResults.Details.Recent)" -ForegroundColor Gray }
-    if ($cleanResults.Details.Temp -gt 0) { Write-Host "  • Temp: $($cleanResults.Details.Temp)" -ForegroundColor Gray }
-
+    
     if ($cleanResults.Errors -gt 0) {
-        Write-Host "`nПопередження: $($cleanResults.Errors) помилок під час очищення" -ForegroundColor Yellow
+        Write-Host "`n⚠️  Попередження: $($cleanResults.Errors) помилок під час очищення" -ForegroundColor Yellow
     }
 } else {
     Write-Host "⚠️  НІЧОГО НЕ ВИДАЛЕНО" -ForegroundColor Yellow
@@ -438,8 +555,12 @@ Write-Host ""
 
 if ($cleanResults.Cleaned -gt 0) {
     Write-Host "Рекомендації:" -ForegroundColor Gray
-    Write-Host "- Для повного ефекту перезавантажте систему" -ForegroundColor Gray
-    Write-Host "- Уникайте повторного запуску підозрілих файлів" -ForegroundColor Gray
+    Write-Host "- Перезапустіть систему для застосування змін" -ForegroundColor Gray
+    Write-Host "- USN Journal був очищений" -ForegroundColor Gray
+    Write-Host "- Всі згадки про файл видалені" -ForegroundColor Gray
+} else {
+    Write-Host "Порада:" -ForegroundColor Red
+    Write-Host "- Можливо, файли заблоковані системою або відсутні права" -ForegroundColor Gray
 }
 
 Start-Sleep -Seconds 5
