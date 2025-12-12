@@ -1,416 +1,347 @@
-function Find-BankFile-Traces {
-    Write-Host "Пошук слідів файла bаnk.exe..." -ForegroundColor Cyan
+function Check-For-Traces {
+    Write-Host "Перевірка наявності слідів у джерелах даних..." -ForegroundColor Cyan
     
-    $searchPatterns = @(
-        'b[аa]nk\.exe',
-        'b.*nk\.exe',
-        'D:\\projects\\c#\\laba1',
-        'D:\\projects\\c#\\la.*nk',
-        '\[CLEANED\]',
-        'File Deleted.*la'
-    )
+    $detectedSources = @()
     
-    $results = @()
-    
-    # 1. Пошук у Results.txt та інших звітах
-    Write-Host "1. Аналіз звітів..." -NoNewline
-    $reportFiles = @(
-        "C:\Temp\Results.txt",
-        "C:\Temp\Dump\Paths.txt",
-        "C:\Temp\Dump\Deletedfile.txt",
-        "C:\Temp\Dump\Unsigned.txt"
-    )
-    
-    $foundInReports = 0
-    foreach ($reportFile in $reportFiles) {
-        if (Test-Path $reportFile) {
+    # 1. Перевірка Prefetch на згадки про файл
+    Write-Host "1. Перевірка Prefetch..." -NoNewline
+    try {
+        $pfFiles = Get-ChildItem "C:\Windows\Prefetch" -Filter "*.pf" -ErrorAction SilentlyContinue | Select-Object -First 10
+        
+        foreach ($pf in $pfFiles) {
             try {
-                $lines = Get-Content $reportFile -ErrorAction SilentlyContinue
-                if ($lines) {
-                    for ($i = 0; $i -lt $lines.Count; $i++) {
-                        foreach ($pattern in $searchPatterns) {
-                            if ($lines[$i] -match $pattern) {
-                                $results += "Звіт ($([System.IO.Path]::GetFileName($reportFile))): Рядок $($i+1): $($lines[$i])"
-                                $foundInReports++
-                                break
-                            }
-                        }
-                    }
+                $content = Get-Content $pf.FullName -Raw -ErrorAction SilentlyContinue
+                if ($content -and ($content -match 'b[аa]nk' -or $content -match 'D:\\projects\\c#')) {
+                    $detectedSources += "Prefetch: $($pf.Name)"
+                    break
                 }
             } catch {}
         }
+        
+        if ($detectedSources | Where-Object { $_ -match "Prefetch" }) {
+            Write-Host " [знайдено]" -ForegroundColor Red
+        } else {
+            Write-Host " [не знайдено]" -ForegroundColor Green
+        }
+    } catch {
+        Write-Host " [помилка]" -ForegroundColor Yellow
     }
-    Write-Host " [$foundInReports знайдено]" -ForegroundColor $(if($foundInReports-gt0){'Red'}else{'Green'})
     
-    # 2. Пошук у Journal файлах
-    Write-Host "2. Аналіз Journal..." -NoNewline
-    $journalFiles = Get-ChildItem "C:\Temp\Dump\Journal" -Filter "*.txt" -ErrorAction SilentlyContinue
-    $foundInJournal = 0
+    # 2. Перевірка USN Journal (через розмір)
+    Write-Host "2. Перевірка USN Journal..." -NoNewline
+    try {
+        $journalInfo = fsutil usn queryjournal C: 2>$null
+        if ($journalInfo -and $journalInfo -match "Usn Journal ID") {
+            # Якщо журнал існує і має дані
+            $detectedSources += "USN Journal: активний"
+            Write-Host " [активний]" -ForegroundColor Red
+        } else {
+            Write-Host " [не активний]" -ForegroundColor Green
+        }
+    } catch {
+        Write-Host " [помилка]" -ForegroundColor Yellow
+    }
     
-    foreach ($journalFile in $journalFiles) {
-        try {
-            $lines = Get-Content $journalFile.FullName -ErrorAction SilentlyContinue
-            if ($lines) {
-                for ($i = 0; $i -lt $lines.Count; $i++) {
-                    foreach ($pattern in $searchPatterns) {
-                        if ($lines[$i] -match $pattern) {
-                            $results += "Journal ($($journalFile.Name)): Рядок $($i+1): $($lines[$i])"
-                            $foundInJournal++
-                            break
-                        }
-                    }
-                }
+    # 3. Перевірка Windows Search кешу
+    Write-Host "3. Перевірка Windows Search..." -NoNewline
+    try {
+        $searchPath = "C:\ProgramData\Microsoft\Search\Data\Applications\Windows"
+        if (Test-Path $searchPath) {
+            $dbFiles = Get-ChildItem $searchPath -Filter "*.edb" -ErrorAction SilentlyContinue
+            if ($dbFiles) {
+                $detectedSources += "Windows Search: кеш присутній"
+                Write-Host " [кеш є]" -ForegroundColor Red
+            } else {
+                Write-Host " [немає]" -ForegroundColor Green
             }
-        } catch {}
-    }
-    Write-Host " [$foundInJournal знайдено]" -ForegroundColor $(if($foundInJournal-gt0){'Red'}else{'Green'})
-    
-    $totalFound = $foundInReports + $foundInJournal
-    
-    Write-Host ""
-    Write-Host "="*50 -ForegroundColor Cyan
-    Write-Host "РЕЗУЛЬТАТ ПОШУКУ:" -ForegroundColor Cyan
-    Write-Host "Всього знайдено згадок: $totalFound" -ForegroundColor $(if($totalFound-gt0){'Yellow'}else{'Green'})
-    
-    if ($totalFound -gt 0) {
-        Write-Host "`nЗнайдені згадки:" -ForegroundColor Yellow
-        foreach ($result in $results | Select-Object -First 10) {
-            Write-Host "  • $result" -ForegroundColor Gray
+        } else {
+            Write-Host " [не знайдено]" -ForegroundColor Gray
         }
-        if ($results.Count -gt 10) {
-            Write-Host "  • ... та ще $($results.Count - 10) інших" -ForegroundColor Gray
-        }
+    } catch {
+        Write-Host " [помилка]" -ForegroundColor Yellow
     }
     
     return @{
-        Total = $totalFound
-        Details = $results
-        Counts = @{
-            Reports = $foundInReports
-            Journal = $foundInJournal
-        }
+        Detected = ($detectedSources.Count -gt 0)
+        Sources = $detectedSources
     }
 }
 
-function Clean-Data-Sources {
+function Clean-Data-Sources-Only {
     Write-Host "`nОчищення джерел даних..." -ForegroundColor Cyan
-    $cleanedSources = 0
-    $errors = 0
     
-    # 1. Очищення USN Journal
-    Write-Host "1. Очищення USN Journal..." -NoNewline
-    try {
-        fsutil usn deletejournal /D C: 2>$null
-        fsutil usn createjournal m=1000 a=100 C: 2>$null
-        $cleanedSources++
-        Write-Host " [виконано]" -ForegroundColor Green
-    } catch {
-        $errors++
-        Write-Host " [помилка]" -ForegroundColor Red
+    $results = @{
+        USNJournal = Clean-USN-Journal
+        Prefetch = Clean-Prefetch-Files
+        WindowsSearch = Clean-Windows-Search-Cache
+        Clipboard = Clean-Clipboard-History
+        TempFiles = Clean-Temp-Script-Files
+        ProcessMemory = Clean-Process-Memory-Cache
+        PowerShellHistory = Clean-PowerShell-History-Only
     }
     
-    # 2. Очищення Prefetch
-    Write-Host "2. Очищення Prefetch..." -NoNewline
+    return $results
+}
+
+function Clean-USN-Journal {
+    Write-Host "• USN Journal..." -NoNewline
+    try {
+        fsutil usn deletejournal /D C: 2>$null
+        # Створюємо новий порожній журнал
+        fsutil usn createjournal m=1000 a=100 C: 2>$null
+        Write-Host " [очищено]" -ForegroundColor Green
+        return $true
+    } catch {
+        Write-Host " [помилка]" -ForegroundColor Red
+        return $false
+    }
+}
+
+function Clean-Prefetch-Files {
+    Write-Host "• Prefetch файли..." -NoNewline
+    $deleted = 0
+    
     try {
         $patterns = @('*bank*', '*bаnk*', '*laba1*', '*c#*')
-        $deletedPrefetch = 0
         
         foreach ($pattern in $patterns) {
             Get-ChildItem "C:\Windows\Prefetch" -Filter "*$pattern*" -ErrorAction SilentlyContinue | 
-                Remove-Item -Force -ErrorAction SilentlyContinue | ForEach-Object { $deletedPrefetch++ }
+                ForEach-Object {
+                    try {
+                        Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue
+                        $deleted++
+                    } catch {}
+                }
         }
         
-        if ($deletedPrefetch -gt 0) {
-            $cleanedSources += $deletedPrefetch
-            Write-Host " [$deletedPrefetch файлів]" -ForegroundColor Green
+        if ($deleted -gt 0) {
+            Write-Host " [$deleted видалено]" -ForegroundColor Green
         } else {
-            Write-Host " [немає згадок]" -ForegroundColor Gray
+            Write-Host " [немає]" -ForegroundColor Gray
         }
+        return $true
     } catch {
-        $errors++
         Write-Host " [помилка]" -ForegroundColor Red
+        return $false
     }
+}
+
+function Clean-Windows-Search-Cache {
+    Write-Host "• Windows Search кеш..." -NoNewline
     
-    # 3. Очищення кешу Windows Search
-    Write-Host "3. Очищення Windows Search..." -NoNewline
     try {
         Stop-Service "WSearch" -Force -ErrorAction SilentlyContinue
         Start-Sleep -Seconds 1
         
-        $searchPaths = @(
-            "C:\ProgramData\Microsoft\Search\Data\Applications\Windows\*",
-            "$env:LOCALAPPDATA\Microsoft\Windows\WebCache\*"
-        )
-        
-        foreach ($path in $searchPaths) {
-            if (Test-Path $path) {
-                Remove-Item $path -Recurse -Force -ErrorAction SilentlyContinue
-            }
+        $searchPath = "C:\ProgramData\Microsoft\Search\Data\Applications\Windows"
+        if (Test-Path $searchPath) {
+            Get-ChildItem $searchPath -Filter "*.edb" -ErrorAction SilentlyContinue | Remove-Item -Force
+            Get-ChildItem $searchPath -Filter "*.db" -ErrorAction SilentlyContinue | Remove-Item -Force
         }
         
         Start-Service "WSearch" -ErrorAction SilentlyContinue
-        $cleanedSources++
-        Write-Host " [виконано]" -ForegroundColor Green
+        Write-Host " [очищено]" -ForegroundColor Green
+        return $true
     } catch {
-        $errors++
+        Write-Host " [помилка]" -ForegroundColor Red
+        return $false
+    }
+}
+
+function Clean-Clipboard-History {
+    Write-Host "• Буфер обміну (Win+V)..." -NoNewline
+    
+    $success = $false
+    
+    try {
+        # 1. Очистити поточний буфер
+        Set-Clipboard -Value $null -ErrorAction SilentlyContinue
+        
+        # 2. Очистити через cmd
+        cmd /c "echo off | clip" 2>$null
+        
+        # 3. Видалити файли історії буфера Windows
+        $clipboardPath = "$env:LOCALAPPDATA\Microsoft\Windows\Clipboard"
+        if (Test-Path $clipboardPath) {
+            Remove-Item "$clipboardPath\*" -Force -Recurse -ErrorAction SilentlyContinue
+        }
+        
+        # 4. Записати безпечний текст
+        Set-Clipboard -Value "System clean" -ErrorAction SilentlyContinue
+        
+        $success = $true
+        Write-Host " [очищено]" -ForegroundColor Green
+    } catch {
         Write-Host " [помилка]" -ForegroundColor Red
     }
     
-    # 4. Очищення пам'яті процесів
-    Write-Host "4. Очищення пам'яті процесів..." -NoNewline
+    return $success
+}
+
+function Clean-Temp-Script-Files {
+    Write-Host "• Тимчасові файли скриптів..." -NoNewline
+    $deleted = 0
+    
     try {
-        # Перезапускаємо процеси, які можуть кешувати дані
+        $tempPatterns = @(
+            "$env:TEMP\*strings*",
+            "$env:TEMP\*PECmd*",
+            "$env:TEMP\*Evtx*",
+            "$env:TEMP\*dump*",
+            "C:\Windows\Temp\*strings*"
+        )
+        
+        foreach ($pattern in $tempPatterns) {
+            if (Test-Path $pattern) {
+                Get-ChildItem $pattern -ErrorAction SilentlyContinue | Remove-Item -Force -Recurse -ErrorAction SilentlyContinue
+                $deleted++
+            }
+        }
+        
+        if ($deleted -gt 0) {
+            Write-Host " [$deleted файлів]" -ForegroundColor Green
+        } else {
+            Write-Host " [немає]" -ForegroundColor Gray
+        }
+        return $true
+    } catch {
+        Write-Host " [помилка]" -ForegroundColor Red
+        return $false
+    }
+}
+
+function Clean-Process-Memory-Cache {
+    Write-Host "• Пам'ять процесів..." -NoNewline
+    
+    try {
+        # Перезапустити explorer для очищення кешу
         Get-Process -Name "explorer" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
         Start-Sleep -Milliseconds 500
         Start-Process "explorer.exe"
         
-        $cleanedSources++
-        Write-Host " [виконано]" -ForegroundColor Green
+        Write-Host " [очищено]" -ForegroundColor Green
+        return $true
     } catch {
-        $errors++
         Write-Host " [помилка]" -ForegroundColor Red
-    }
-    
-    return @{
-        Cleaned = $cleanedSources
-        Errors = $errors
+        return $false
     }
 }
 
-function Clean-Files {
-    Write-Host "`nОчищення файлів..." -ForegroundColor Cyan
-    $cleanedLines = 0
-    $errors = 0
+function Clean-PowerShell-History-Only {
+    Write-Host "• Історія PowerShell..." -NoNewline
     
-    $patternsToRemove = @(
-        'D:\\projects\\c#\\laba1',
-        'D:\\projects\\c#\\la.*nk',
-        'b[аa]nk\.exe',
-        'b.*nk\.exe',
-        'File Deleted.*laba1',
-        'File Deleted.*bank',
-        'File Deleted.*c#',
-        '\[CLEANED\]',
-        'projects\\\\c#'
-    )
-    
-    # Список файлів для очищення
-    $filesToClean = @(
-        "C:\Temp\Results.txt",
-        "C:\Temp\Dump\Paths.txt",
-        "C:\Temp\Dump\Deletedfile.txt",
-        "C:\Temp\Dump\Unsigned.txt",
-        "C:\Temp\Dump\Debug.txt",
-        "C:\Temp\Dump\Filesize.txt"
-    )
-    
-    # Додаємо всі Journal файли
-    $journalFiles = Get-ChildItem "C:\Temp\Dump\Journal" -Filter "*.txt" -ErrorAction SilentlyContinue
-    foreach ($journalFile in $journalFiles) {
-        $filesToClean += $journalFile.FullName
-    }
-    
-    foreach ($filePath in $filesToClean) {
-        if (Test-Path $filePath) {
-            $fileName = [System.IO.Path]::GetFileName($filePath)
-            Write-Host "  • $fileName..." -NoNewline
-            
-            try {
-                $lines = Get-Content $filePath -ErrorAction SilentlyContinue
-                if ($lines) {
-                    $newLines = @()
-                    $linesRemoved = 0
-                    
-                    foreach ($line in $lines) {
-                        $shouldKeep = $true
-                        foreach ($pattern in $patternsToRemove) {
-                            if ($line -match $pattern) {
-                                $shouldKeep = $false
-                                $linesRemoved++
-                                break
-                            }
-                        }
-                        if ($shouldKeep) {
-                            $newLines += $line
-                        }
-                    }
-                    
-                    if ($linesRemoved -gt 0) {
-                        Set-Content -Path $filePath -Value $newLines -Force -ErrorAction SilentlyContinue
-                        $cleanedLines += $linesRemoved
-                        Write-Host " [$linesRemoved рядків]" -ForegroundColor Green
-                    } else {
-                        Write-Host " [чистий]" -ForegroundColor Gray
-                    }
-                } else {
-                    Write-Host " [порожній]" -ForegroundColor Gray
-                }
-            } catch {
-                $errors++
-                Write-Host " [помилка]" -ForegroundColor Red
-            }
-        }
-    }
-    
-    # Видалення порожніх файлів
-    Write-Host "  • Видалення порожніх файлів..." -NoNewline
-    $emptyFilesDeleted = 0
-    
-    foreach ($filePath in $filesToClean) {
-        if (Test-Path $filePath) {
-            try {
-                $content = Get-Content $filePath -Raw -ErrorAction SilentlyContinue
-                if ([string]::IsNullOrWhiteSpace($content)) {
-                    Remove-Item $filePath -Force -ErrorAction SilentlyContinue
-                    $emptyFilesDeleted++
-                }
-            } catch {}
-        }
-    }
-    
-    if ($emptyFilesDeleted -gt 0) {
-        Write-Host " [$emptyFilesDeleted файлів]" -ForegroundColor Green
-    } else {
-        Write-Host " [немає]" -ForegroundColor Gray
-    }
-    
-    return @{
-        LinesRemoved = $cleanedLines
-        EmptyFilesDeleted = $emptyFilesDeleted
-        Errors = $errors
-    }
-}
-
-function Clear-Clipboard-Safe {
     try {
-        Set-Clipboard -Value $null -ErrorAction SilentlyContinue
+        Clear-History
+        
+        # Видалити файл історії
+        $historyPath = (Get-PSReadlineOption).HistorySavePath
+        if (Test-Path $historyPath) {
+            Remove-Item $historyPath -Force -ErrorAction SilentlyContinue
+        }
+        
+        Write-Host " [очищено]" -ForegroundColor Green
+        return $true
     } catch {
-        try {
-            cmd /c "echo off | clip" 2>$null
-        } catch {}
+        Write-Host " [помилка]" -ForegroundColor Red
+        return $false
     }
 }
 
-# ===== Головна частина =====
-Write-Host "=== Advanced Trace Cleaner ===" -ForegroundColor Blue
-Write-Host "Повне очищення слідів файла" -ForegroundColor Gray
-Write-Host "Одночасно очищує джерела даних та файли" -ForegroundColor Gray
+# === Головна частина ===
+Write-Host "=== SYSTEM SOURCES CLEANER ===" -ForegroundColor Blue
+Write-Host "Очищення ДЖЕРЕЛ ДАНИХ (не файлів)" -ForegroundColor Gray
 Write-Host ""
 
-Write-Host "Цей скрипт робить одночасно:" -ForegroundColor Yellow
-Write-Host "1. Очищує USN Journal (джерело 'File Deleted')" -ForegroundColor Gray
-Write-Host "2. Видаляє Prefetch файли" -ForegroundColor Gray
-Write-Host "3. Очищує кеш Windows Search" -ForegroundColor Gray
-Write-Host "4. Видаляє згадки з Results.txt та інших файлів" -ForegroundColor Gray
-Write-Host "5. Очищує буфер обміну" -ForegroundColor Gray
+Write-Host "ВАЖЛИВО:" -ForegroundColor Red
+Write-Host "• НЕ ЧІПАЄ Results.txt" -ForegroundColor Red
+Write-Host "• НЕ ЧІПАЄ жодні файли в C:\Temp\Dump\" -ForegroundColor Red
+Write-Host "• Очищує тільки ДЖЕРЕЛА ДАНИХ" -ForegroundColor Red
 Write-Host ""
 
-# Пошук слідів
-Write-Host "Шукаю згадки про файл..." -ForegroundColor Cyan
-$searchResults = Find-BankFile-Traces
+Write-Host "Очищує джерела даних:" -ForegroundColor Yellow
+Write-Host "1. USN Journal (звідси береться 'File Deleted:')" -ForegroundColor Gray
+Write-Host "2. Prefetch файли" -ForegroundColor Gray
+Write-Host "3. Windows Search кеш" -ForegroundColor Gray
+Write-Host "4. Буфер обміну (Win+V)" -ForegroundColor Gray
+Write-Host "5. Тимчасові файли скриптів" -ForegroundColor Gray
+Write-Host "6. Пам'ять процесів" -ForegroundColor Gray
+Write-Host "7. Історію PowerShell" -ForegroundColor Gray
+Write-Host ""
 
-if ($searchResults.Total -eq 0) {
+Write-Host "Після очищення:" -ForegroundColor Green
+Write-Host "• Детектор НЕ ЗНАЙДЕ 'File Deleted: D:\projects\c#\la[CLEANED]'" -ForegroundColor Gray
+Write-Host "• Бо USN Journal буде порожній" -ForegroundColor Gray
+Write-Host "• Results.txt буде створено ЗАНОВО без цих записів" -ForegroundColor Gray
+Write-Host ""
+
+# Перевірка джерел даних
+Write-Host "Перевіряю джерела даних..." -ForegroundColor Cyan
+$checkResults = Check-For-Traces
+
+if ($checkResults.Detected) {
     Write-Host ""
-    Write-Host "="*50 -ForegroundColor Green
-    Write-Host "✅ ЗГАДКИ ПРО ФАЙЛ НЕ ЗНАЙДЕНО" -ForegroundColor Green
-    Write-Host "Система чиста, слідів файла немає" -ForegroundColor Green
-    
-    # Все одно чистимо джерела на всякий випадок
-    Write-Host "`nПрофілактичне очищення джерел даних..." -ForegroundColor Cyan
-    Clean-Data-Sources | Out-Null
-    
-    Write-Host "="*50 -ForegroundColor Green
-    Start-Sleep -Seconds 2
-    exit 0
-}
-
-Write-Host ""
-Write-Host "Знайдено $($searchResults.Total) згадок. Продовжити повне очищення?" -ForegroundColor Yellow
-$response = Read-Host "Введіть Y для очищення або N для скасування"
-
-if ($response -ne 'Y') {
-    Write-Host "`nОчищення скасовано" -ForegroundColor Red
-    Start-Sleep -Seconds 2
-    exit 0
-}
-
-Write-Host ""
-Write-Host "Починаю повне очищення..." -ForegroundColor Cyan
-
-# Крок 1: Очищення джерел даних
-Write-Host "`n=== КРОК 1: Очищення джерел даних ===" -ForegroundColor Blue
-$dataResults = Clean-Data-Sources
-
-# Крок 2: Очищення файлів
-Write-Host "`n=== КРОК 2: Очищення файлів ===" -ForegroundColor Blue
-$fileResults = Clean-Files
-
-# Крок 3: Очищення буфера обміну
-Write-Host "`n=== КРОК 3: Очищення буфера обміну ===" -ForegroundColor Blue
-Write-Host "Очищення буфера обміну..." -NoNewline
-Clear-Clipboard-Safe
-Write-Host " [виконано]" -ForegroundColor Green
-
-# Крок 4: Очищення історії PowerShell
-Write-Host "`n=== КРОК 4: Очищення історії ===" -ForegroundColor Blue
-Write-Host "Очищення історії PowerShell..." -NoNewline
-try {
-    Clear-History
-    Remove-Item (Get-PSReadlineOption).HistorySavePath -ErrorAction SilentlyContinue 2>$null
-    Write-Host " [виконано]" -ForegroundColor Green
-} catch {
-    Write-Host " [помилка]" -ForegroundColor Red
-}
-
-# Фінальна перевірка
-Write-Host "`n=== ФІНАЛЬНА ПЕРЕВІРКА ===" -ForegroundColor Blue
-Write-Host "Перевірка результатів..." -ForegroundColor Cyan
-$finalCheck = Find-BankFile-Traces
-
-Write-Host ""
-Write-Host "="*60 -ForegroundColor Cyan
-Write-Host "ПІДСУМОК ОЧИЩЕННЯ:" -ForegroundColor Cyan
-Write-Host "="*60 -ForegroundColor Cyan
-
-if ($finalCheck.Total -eq 0) {
-    Write-Host "✅ УСПІШНО ОЧИЩЕНО" -ForegroundColor Green
-    Write-Host "Всі згадки про файл видалені" -ForegroundColor Green
-    
-    Write-Host "`nВиконано:" -ForegroundColor Yellow
-    Write-Host "  • USN Journal: очищений та перестворений" -ForegroundColor Gray
-    Write-Host "  • Prefetch файли: видалені" -ForegroundColor Gray
-    Write-Host "  • Windows Search: кеш очищений" -ForegroundColor Gray
-    Write-Host "  • Файли: $($fileResults.LinesRemoved) рядків видалено" -ForegroundColor Gray
-    Write-Host "  • Буфер обміну: очищений" -ForegroundColor Gray
-    
-    if ($fileResults.EmptyFilesDeleted -gt 0) {
-        Write-Host "  • Порожні файли: $($fileResults.EmptyFilesDeleted) видалено" -ForegroundColor Gray
+    Write-Host "Знайдено сліди в:" -ForegroundColor Yellow
+    foreach ($source in $checkResults.Sources) {
+        Write-Host "  • $source" -ForegroundColor Gray
     }
+    Write-Host ""
 } else {
-    Write-Host "⚠️  ЧАСТКОВО ОЧИЩЕНО" -ForegroundColor Yellow
-    Write-Host "Залишилося $($finalCheck.Total) згадок" -ForegroundColor Yellow
-    
-    Write-Host "`nВиконано:" -ForegroundColor Yellow
-    Write-Host "  • Очищено джерел даних: $($dataResults.Cleaned)" -ForegroundColor Gray
-    Write-Host "  • Видалено рядків: $($fileResults.LinesRemoved)" -ForegroundColor Gray
-    Write-Host "  • Залишилося згадок: $($finalCheck.Total)" -ForegroundColor Gray
+    Write-Host ""
+    Write-Host "✅ Джерела даних чисті" -ForegroundColor Green
+    Write-Host ""
 }
 
-if (($dataResults.Errors + $fileResults.Errors) -gt 0) {
-    Write-Host "`n⚠️  Попередження: $($dataResults.Errors + $fileResults.Errors) помилок" -ForegroundColor Yellow
+$confirm = Read-Host "Очистити джерела даних та буфер обміну? (Y/N)"
+if ($confirm -ne 'Y') {
+    Write-Host "`nСкасовано" -ForegroundColor Red
+    exit
+}
+
+Write-Host ""
+Write-Host "Починаю очищення джерел даних..." -ForegroundColor Cyan
+Write-Host ""
+
+# Виконання очищення
+$cleanResults = Clean-Data-Sources-Only
+
+Write-Host ""
+Write-Host "="*60 -ForegroundColor Cyan
+Write-Host "РЕЗУЛЬТАТ ОЧИЩЕННЯ ДЖЕРЕЛ ДАНИХ:" -ForegroundColor Cyan
+
+$successCount = ($cleanResults.Values | Where-Object { $_ -eq $true }).Count
+
+if ($successCount -gt 0) {
+    Write-Host "✅ ДЖЕРЕЛА ДАНИХ ОЧИЩЕНО" -ForegroundColor Green
+    
+    Write-Host "`nОчищено:" -ForegroundColor Yellow
+    
+    if ($cleanResults.USNJournal) { Write-Host "  • USN Journal - тепер порожній" -ForegroundColor Gray }
+    if ($cleanResults.Prefetch) { Write-Host "  • Prefetch файли зі згадками" -ForegroundColor Gray }
+    if ($cleanResults.WindowsSearch) { Write-Host "  • Windows Search кеш" -ForegroundColor Gray }
+    if ($cleanResults.Clipboard) { Write-Host "  • Буфер обміну (Win+V)" -ForegroundColor Gray }
+    if ($cleanResults.TempFiles) { Write-Host "  • Тимчасові файли скриптів" -ForegroundColor Gray }
+    if ($cleanResults.ProcessMemory) { Write-Host "  • Пам'ять процесів" -ForegroundColor Gray }
+    if ($cleanResults.PowerShellHistory) { Write-Host "  • Історія PowerShell" -ForegroundColor Gray }
+    
+    Write-Host "`nТепер при запуску детектора:" -ForegroundColor Green
+    Write-Host "1. USN Journal порожній → 'File Deleted:' НЕ БУДЕ знайдено" -ForegroundColor Gray
+    Write-Host "2. Results.txt буде створено ЗАНОВО без старих записів" -ForegroundColor Gray
+    Write-Host "3. Натисни Win+V - історія буфера чиста" -ForegroundColor Gray
+    
+} else {
+    Write-Host "⚠️  НЕ ВДАЛОСЯ ОЧИСТИТИ ДЖЕРЕЛА" -ForegroundColor Red
 }
 
 Write-Host "="*60 -ForegroundColor Cyan
 Write-Host ""
 
-Write-Host "Тепер при запуску детектора:" -ForegroundColor Yellow
-Write-Host "• 'File Deleted: D:\projects\c#\la[CLEANED]' - НЕ БУДЕ знайдено" -ForegroundColor Gray
-Write-Host "• USN Journal - порожній" -ForegroundColor Gray
-Write-Host "• Results.txt - очищений від згадок" -ForegroundColor Gray
+Write-Host "Вони будуть перезаписані при наступному запуску детектора" -ForegroundColor Gray
 
-Write-Host "`nРекомендації:" -ForegroundColor Gray
-Write-Host "1. Перезавантажте комп'ютер для повного ефекту" -ForegroundColor Gray
-Write-Host "2. Після перезавантаження всі сліди будуть видалені" -ForegroundColor Gray
+Write-Host ""
+Write-Host "Щоб перевірити результат:" -ForegroundColor Yellow
+Write-Host "1. Запусти скрипт-детектор заново" -ForegroundColor Gray
+Write-Host "2. Він створить НОВИЙ Results.txt" -ForegroundColor Gray
+Write-Host "3. 'File Deleted: D:\projects\c#\la[CLEANED]' НЕ З'ЯВИТЬСЯ" -ForegroundColor Gray
 
-Write-Host "`nСкрипт завершено. Завершення через 5 секунд..." -ForegroundColor Gray
-Start-Sleep -Seconds 5
+Write-Host "`nЗавершення через 3 секунди..." -ForegroundColor Gray
+Start-Sleep -Seconds 3
